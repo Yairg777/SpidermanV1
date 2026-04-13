@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spider-Man AR: Neural Link</title>
+    
+    <!-- CDNs -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.158.0/three.min.js"></script>
+
+    <style>
+        :root {
+            --spidey-red: #ff0000;
+            --spidey-blue: #00d4ff;
+            --hud-bg: rgba(15, 0, 0, 0.85);
+        }
+
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; font-family: 'Segoe UI', Roboto, sans-serif; }
+
+        /* LAYER 1: VIDEO */
+        #video_container {
+            position: absolute; inset: 0; transform: scaleX(-1);
+        }
+        #input_video { width: 100%; height: 100%; object-fit: cover; }
+
+        /* LAYER 2: HANDS CANVAS */
+        #hand_canvas {
+            position: absolute; inset: 0; z-index: 5;
+            pointer-events: none; transform: scaleX(-1);
+        }
+
+        /* LAYER 3: THREE.JS MASK & HUD */
+        #three_canvas {
+            position: absolute; inset: 0; z-index: 10;
+            pointer-events: none;
+        }
+
+        /* AI ASSISTANT PANEL */
+        #ai_panel {
+            position: absolute;
+            right: 20px; top: 20px;
+            width: 320px; height: 450px;
+            background: var(--hud-bg);
+            border-left: 3px solid var(--spidey-red);
+            z-index: 100;
+            display: flex; flex-direction: column;
+            color: white;
+            box-shadow: 0 0 20px rgba(255,0,0,0.3);
+            backdrop-filter: blur(10px);
+            clip-path: polygon(0 0, 100% 0, 100% 90%, 90% 100%, 0 100%);
+        }
+
+        .header { padding: 15px; font-size: 12px; letter-spacing: 2px; color: var(--spidey-red); border-bottom: 1px solid rgba(255,0,0,0.2); }
+        #chat_box { flex: 1; overflow-y: auto; padding: 15px; font-size: 13px; line-height: 1.5; }
+        .msg { margin-bottom: 12px; padding-bottom: 5px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .ai { color: var(--spidey-blue); }
+        .user { color: #fff; text-align: right; }
+
+        .input_area { padding: 10px; display: flex; gap: 5px; background: rgba(0,0,0,0.3); }
+        #ai_input {
+            flex: 1; background: transparent; border: 1px solid var(--spidey-red);
+            color: white; padding: 8px; outline: none;
+        }
+        #send_btn { background: var(--spidey-red); border: none; color: white; padding: 0 15px; cursor: pointer; }
+
+        /* HUD OVERLAYS */
+        #hud_frames {
+            position: absolute; inset: 0; z-index: 50; pointer-events: none;
+            border: 40px solid transparent;
+            border-image: url('https://www.transparenttextures.com/patterns/carbon-fibre.png') 30 round;
+            opacity: 0.3;
+        }
+        .scanline {
+            width: 100%; height: 4px; background: rgba(255,0,0,0.1);
+            position: absolute; animation: scanning 4s linear infinite;
+        }
+        @keyframes scanning { from { top: 0; } to { top: 100%; } }
+
+        #status_bar {
+            position: absolute; bottom: 20px; left: 20px; color: var(--spidey-red);
+            font-size: 10px; z-index: 100; letter-spacing: 1px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="video_container">
+        <video id="input_video" autoplay playsinline></video>
+    </div>
+
+    <canvas id="hand_canvas"></canvas>
+    <canvas id="three_canvas"></canvas>
+
+    <div id="hud_frames"></div>
+    <div class="scanline"></div>
+
+    <div id="status_bar">
+        SYNC: STABLE // NEURAL LINK: ACTIVE // FPS: <span id="fps_val">60</span>
+    </div>
+
+    <div id="ai_panel">
+        <div class="header">K.A.R.E.N. v4.0 - NEURAL ASSISTANT</div>
+        <div id="chat_box">
+            <div class="msg ai">SYSTEM: Calibration complete. Mask holographic mesh anchored. How can I assist, Peter?</div>
+        </div>
+        <div class="input_area">
+            <input type="text" id="ai_input" placeholder="Query Neural Link..." autocomplete="off">
+            <button id="send_btn">></button>
+        </div>
+    </div>
+
+    <script>
+        /**
+         * 1. INITIALIZATION & SETUP
+         */
+        const video = document.getElementById('input_video');
+        const handCanvas = document.getElementById('hand_canvas');
+        const handCtx = handCanvas.getContext('2d');
+        const threeCanvas = document.getElementById('three_canvas');
+        const fpsLabel = document.getElementById('fps_val');
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ canvas: threeCanvas, alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+
+        // Resize handler
+        window.addEventListener('resize', () => {
+            const w = window.innerWidth, h = window.innerHeight;
+            renderer.setSize(w, h);
+            camera.aspect = w/h;
+            camera.updateProjectionMatrix();
+            handCanvas.width = w;
+            handCanvas.height = h;
+        });
+        window.dispatchEvent(new Event('resize'));
+
+        /**
+         * 2. HOLOGRAPHIC MASK CONSTRUCTION
+         * Instead of a static model, we build a dynamic BufferGeometry 
+         * using the MediaPipe FaceMesh indices.
+         */
+        let faceGeometry = new THREE.BufferGeometry();
+        const maskMaterial = new THREE.LineBasicMaterial({ 
+            color: 0xff0000, 
+            transparent: true, 
+            opacity: 0.6,
+            blending: THREE.AdditiveBlending 
+        });
+
+        // Use a subset of indices to create a Spider-Man wireframe look
+        // In a full implementation, we'd use the FACEMESH_TESSELATION
+        const maskLines = new THREE.LineSegments(faceGeometry, maskMaterial);
+        scene.add(maskLines);
+
+        // Particles that float around the face
+        const partCount = 100;
+        const partGeo = new THREE.BufferGeometry();
+        const partPos = new Float32Array(partCount * 3);
+        for(let i=0; i<partCount*3; i++) partPos[i] = (Math.random()-0.5) * 5;
+        partGeo.setAttribute('position', new THREE.BufferAttribute(partPos, 3));
+        const partMat = new THREE.PointsMaterial({ color: 0x00d4ff, size: 0.05, transparent: true, opacity: 0.8 });
+        const particles = new THREE.Points(partGeo, partMat);
+        scene.add(particles);
+
+        /**
+         * 3. MEDIAPIPE TRACKING
+         */
+        const faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+        const hands = new Hands({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+
+        faceMesh.onResults(onFaceResults);
+        hands.onResults(onHandResults);
+
+        function onFaceResults(results) {
+            if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+                maskLines.visible = false;
+                return;
+            }
+            maskLines.visible = true;
+            const landmarks = results.multiFaceLandmarks[0];
+
+            // Update Geometry Vertices
+            const vertices = new Float32Array(landmarks.length * 3);
+            for (let i = 0; i < landmarks.length; i++) {
+                const lm = landmarks[i];
+                // Convert normalized (0-1) to Three.js (-5 to 5 approx)
+                vertices[i * 3] = -(lm.x - 0.5) * 10 * (camera.aspect); 
+                vertices[i * 3 + 1] = -(lm.y - 0.5) * 10;
+                vertices[i * 3 + 2] = -lm.z * 10;
+            }
+
+            // If first run, initialize index (FaceMesh Tesselation)
+            if (!faceGeometry.index) {
+                const indices = [];
+                // Simplified tessellation helper
+                for (let i = 0; i < landmarks.length - 1; i++) {
+                    indices.push(i, i + 1);
+                }
+                faceGeometry.setIndex(indices);
+            }
+
+            faceGeometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+            faceGeometry.attributes.position.needsUpdate = true;
+
+            // Anchor particles to face position
+            particles.position.set(-(landmarks[1].x-0.5)*10, -(landmarks[1].y-0.5)*10, 0);
+        }
+
+        function onHandResults(results) {
+            handCtx.clearRect(0, 0, handCanvas.width, handCanvas.height);
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    drawConnectors(handCtx, landmarks, HAND_CONNECTIONS, {color: '#ff0000', lineWidth: 2});
+                    drawLandmarks(handCtx, landmarks, {color: '#00d4ff', lineWidth: 1, radius: 4});
+                }
+            }
+        }
+
+        const cameraFeed = new Camera(video, {
+            onFrame: async () => {
+                await faceMesh.send({ image: video });
+                await hands.send({ image: video });
+            },
+            width: 1280, height: 720
+        });
+        cameraFeed.start();
+
+        /**
+         * 4. INTELLIGENT AI ASSISTANT LOGIC
+         */
+        const aiInput = document.getElementById('ai_input');
+        const chatBox = document.getElementById('chat_box');
+        const sendBtn = document.getElementById('send_btn');
+
+        // Context Memory
+        let context = {
+            userName: "Peter",
+            suitMode: "Stealth",
+            history: []
+        };
+
+        async function processAIResponse(input) {
+            const query = input.toLowerCase();
+            let response = "";
+
+            // 1. Check for Real API (Template for user to add Key)
+            const OPENAI_API_KEY = ""; // PASTE KEY HERE FOR REAL AI
+            if (OPENAI_API_KEY) {
+                try {
+                    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+                        body: JSON.stringify({
+                            model: "gpt-3.5-turbo",
+                            messages: [{role: "system", content: "You are KAREN, Spider-Man's suit AI. Be helpful, technical, and witty."}, ...context.history, {role: "user", content: input}]
+                        })
+                    });
+                    const data = await res.json();
+                    return data.choices[0].message.content;
+                } catch (e) { console.error("API Error", e); }
+            }
+
+            // 2. Advanced Rule-Based Reasoning (Fallback)
+            if (query.includes("status") || query.includes("check")) {
+                response = "All systems operational. Holographic mesh integrity at 94%. Web fluid pressure is optimal.";
+            } else if (query.includes("who are you")) {
+                response = "I am K.A.R.E.N. (Knowledge Estimate and Response Network). Currently managing your Neural Link AR overlay.";
+            } else if (query.includes("calculate") || query.match(/[0-9]/)) {
+                try {
+                    const expression = query.replace(/[a-z]/g, '');
+                    response = `Processing calculation... Result: ${eval(expression)}. Mathematical precision verified.`;
+                } catch { response = "Calculation error. Please provide a clear numerical string."; }
+            } else if (query.includes("mode")) {
+                response = "Switching suit visuals to high-intensity holographic pulse. Combat mode standby.";
+                maskMaterial.color.setHex(0x00d4ff);
+            } else if (query.includes("hello") || query.includes("hey")) {
+                response = `Greetings, ${context.userName}. Monitoring local NYPD frequencies for activity. Anything else?`;
+            } else {
+                response = "Analyzing query... I've logged this to your mission report. My current database suggests we prioritize local area scanning.";
+            }
+
+            return response;
+        }
+
+        async function handleSend() {
+            const val = aiInput.value.trim();
+            if (!val) return;
+
+            // Update UI
+            chatBox.innerHTML += `<div class="msg user">${val}</div>`;
+            aiInput.value = "";
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            // Think
+            const loadingId = "load_" + Date.now();
+            chatBox.innerHTML += `<div class="msg ai" id="${loadingId}">KAREN: Processing Neural Link...</div>`;
+            
+            const reply = await processAIResponse(val);
+            document.getElementById(loadingId).innerHTML = `KAREN: ${reply}`;
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            // Save History
+            context.history.push({role: "user", content: val}, {role: "assistant", content: reply});
+            if (context.history.length > 10) context.history.shift();
+        }
+
+        sendBtn.addEventListener('click', handleSend);
+        aiInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') handleSend(); });
+
+        /**
+         * 5. ANIMATION LOOP
+         */
+        let lastTime = 0;
+        function animate(now) {
+            // FPS Logic
+            const delta = now - lastTime;
+            lastTime = now;
+            fpsLabel.innerText = Math.round(1000 / delta);
+
+            // Rotate particles for "living hologram" effect
+            particles.rotation.y += 0.01;
+            
+            renderer.render(scene, camera);
+            requestAnimationFrame(animate);
+        }
+        requestAnimationFrame(animate);
+
+    </script>
+</body>
+</html>
