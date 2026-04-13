@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web-Shooter AR Interaction</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        canvas { display: block; }
+        #video-container {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1); /* Mirror webcam */
+            z-index: -1;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+            pointer-events: none;
+        }
+        .gesture-hint {
+            font-weight: bold;
+            color: #ff3e3e;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 1.5rem;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Loading AI Models...</div>
+    <div id="ui">
+        <h1>Web-Shooter AR</h1>
+        <p>Gesture: <span class="gesture-hint">Index + Pinky UP</span> (Middle/Ring Down)</p>
+        <p id="status">Status: Searching for hand...</p>
+    </div>
+
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline></video>
+    </div>
+
+    <!-- MediaPipe and Three.js via CDNs -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
+
+    <script>
+        /**
+         * CONFIGURATION & STATE
+         */
+        const videoElement = document.getElementById('webcam');
+        const statusElement = document.getElementById('status');
+        const loadingElement = document.getElementById('loading');
+        
+        let scene, camera, renderer, raycaster;
+        let cans = [];
+        let activeWebs = new Map(); // Store webs per hand
+        const MAX_WEB_DIST = 15;
+        const WEB_COLOR = 0xffffff;
+
+        /**
+         * PHYSICS CONSTANTS
+         */
+        const GRAVITY = -0.01;
+        const DAMPING = 0.95;
+        const SPRING_STIFFNESS = 0.1;
+
+        /**
+         * THREE.JS SETUP
+         */
+        function initScene() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 5;
+
+            renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+            scene.add(ambientLight);
+
+            const light = new THREE.DirectionalLight(0xffffff, 2);
+            light.position.set(0, 10, 10);
+            scene.add(light);
+
+            raycaster = new THREE.Raycaster();
+
+            // Create floating objects (Cans)
+            const canGeometry = new THREE.CylinderGeometry(0.2, 0.2, 0.5, 16);
+            for (let i = 0; i < 12; i++) {
+                const material = new THREE.MeshStandardMaterial({ 
+                    color: Math.random() * 0xffffff,
+                    metalness: 0.7,
+                    roughness: 0.2
+                });
+                const can = new THREE.Mesh(canGeometry, material);
+                
+                resetCan(can);
+                scene.add(can);
+                cans.push(can);
+            }
+        }
+
+        function resetCan(can) {
+            can.position.set(
+                (Math.random() - 0.5) * 8,
+                (Math.random() - 0.5) * 4 + 1,
+                (Math.random() - 2) * 3 // Positioned in front of camera
+            );
+            can.userData = {
+                velocity: new THREE.Vector3(),
+                isGrabbed: false,
+                floatOffset: Math.random() * Math.PI * 2
+            };
+        }
+
+        /**
+         * GESTURE DETECTION LOGIC
+         * Spidey Pose: Index(8) and Pinky(20) up. Middle(12) and Ring(16) down.
+         */
+        function detectSpideyGesture(landmarks) {
+            const wrist = landmarks[0];
+            
+            // Check if fingers are "extended" relative to the wrist and MCP joints
+            const isIndexUp = landmarks[8].y < landmarks[6].y;
+            const isPinkyUp = landmarks[20].y < landmarks[18].y;
+            const isMiddleDown = landmarks[12].y > landmarks[10].y;
+            const isRingDown = landmarks[16].y > landmarks[14].y;
+
+            return isIndexUp && isPinkyUp && isMiddleDown && isRingDown;
+        }
+
+        /**
+         * MEDIAPIPE HANDS SETUP
+         */
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        hands.onResults(onResults);
+
+        const cameraFeed = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        cameraFeed.start();
+
+        /**
+         * CORE INTERACTION LOGIC
+         */
+        function onResults(results) {
+            loadingElement.style.display = 'none';
+            
+            // Update UI
+            if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+                statusElement.innerText = "Status: Searching for hand...";
+            } else {
+                statusElement.innerText = "Status: Tracking active";
+            }
+
+            // Track IDs currently seen in this frame
+            const activeHandIndices = new Set();
+
+            if (results.multiHandLandmarks) {
+                results.multiHandLandmarks.forEach((landmarks, index) => {
+                    activeHandIndices.add(index);
+                    
+                    // Convert MediaPipe coords (0-1) to Three.js coords (-X to X)
+                    // Note: x is flipped because webcam is mirrored
+                    const handX = (1 - landmarks[9].x - 0.5) * 10; 
+                    const handY = (-(landmarks[9].y - 0.5)) * 6;
+                    const handPos = new THREE.Vector3(handX, handY, 1);
+
+                    const isSpidey = detectSpideyGesture(landmarks);
+
+                    if (isSpidey) {
+                        handleWebInteraction(index, handPos);
+                    } else {
+                        releaseWeb(index);
+                    }
+                });
+            }
+
+            // Clean up webs for hands no longer visible
+            for (let index of activeWebs.keys()) {
+                if (!activeHandIndices.has(index)) releaseWeb(index);
+            }
+        }
+
+        function handleWebInteraction(handIndex, handPos) {
+            if (activeWebs.has(handIndex)) {
+                // Already has a web, update its position
+                const webData = activeWebs.get(handIndex);
+                webData.line.geometry.setFromPoints([handPos, webData.targetObject.position]);
+                
+                // Apply spring force to object
+                const target = webData.targetObject;
+                const force = new THREE.Vector3().subVectors(handPos, target.position);
+                const dist = force.length();
+                
+                force.normalize().multiplyScalar(dist * SPRING_STIFFNESS);
+                target.userData.velocity.add(force);
+                target.userData.isGrabbed = true;
+
+            } else {
+                // Shoot a new web!
+                // Raycast from "camera" through hand position
+                raycaster.setFromCamera(
+                    new THREE.Vector2(-(handPos.x/5), handPos.y/3), // Normalized screen coords
+                    camera
+                );
+
+                const intersects = raycaster.intersectObjects(cans);
+                if (intersects.length > 0) {
+                    const target = intersects[0].object;
+                    
+                    // Create visual web line
+                    const material = new THREE.LineBasicMaterial({ color: WEB_COLOR, linewidth: 2 });
+                    const geometry = new THREE.BufferGeometry().setFromPoints([handPos, target.position]);
+                    const line = new THREE.Line(geometry, material);
+                    scene.add(line);
+
+                    activeWebs.set(handIndex, {
+                        line: line,
+                        targetObject: target
+                    });
+                }
+            }
+        }
+
+        function releaseWeb(handIndex) {
+            if (activeWebs.has(handIndex)) {
+                const webData = activeWebs.get(handIndex);
+                scene.remove(webData.line);
+                webData.targetObject.userData.isGrabbed = false;
+                activeWebs.delete(handIndex);
+            }
+        }
+
+        /**
+         * ANIMATION LOOP
+         */
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Update Physics for all cans
+            cans.forEach(can => {
+                const data = can.userData;
+
+                if (!data.isGrabbed) {
+                    // Idle floating motion
+                    data.floatOffset += 0.02;
+                    data.velocity.y += Math.sin(data.floatOffset) * 0.001;
+                    
+                    // Apply subtle "air resistance"
+                    data.velocity.multiplyScalar(DAMPING);
+                } else {
+                    // While grabbed, add strong damping to make it feel "heavy" in the web
+                    data.velocity.multiplyScalar(0.8);
+                }
+
+                // Apply velocity
+                can.position.add(data.velocity);
+
+                // Simple floor/ceiling bounds
+                if (can.position.y < -4) {
+                    can.position.y = -4;
+                    data.velocity.y *= -0.5;
+                }
+                if (can.position.y > 4) {
+                    can.position.y = 4;
+                    data.velocity.y *= -0.5;
+                }
+                
+                // Return to center if drifted too far
+                if (can.position.length() > 15) resetCan(can);
+                
+                // Spin the can
+                can.rotation.x += 0.01;
+                can.rotation.y += 0.02;
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        /**
+         * RESIZE HANDLING
+         */
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Start everything
+        initScene();
+        animate();
+
+    </script>
+</body>
+</html>
